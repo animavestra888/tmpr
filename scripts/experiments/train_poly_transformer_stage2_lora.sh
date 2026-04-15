@@ -8,7 +8,8 @@ PYTHON="python"
 MODEL_DIR="models/Qwen3-VL-2B-Instruct"
 TRAIN_JSONL="data/hiertext/jsonl_max300/train.jsonl"
 EVAL_JSONL="data/hiertext/jsonl_max300/validation.jsonl"
-OUTPUT_DIR="runs/hiertext_polygon_transformer_qwen3vl"
+POLYGON_ADAPTER="runs/hiertext_polygon_transformer_stage1_encoder/final/polygon_adapter.pt"
+OUTPUT_DIR="runs/hiertext_polygon_transformer_stage2_lora"
 DEEPSPEED_CONFIG="configs/deepspeed_zero2.json"
 
 DEVICE="auto"
@@ -19,7 +20,7 @@ MAX_EVAL_SAMPLES=128
 PER_DEVICE_TRAIN_BATCH_SIZE=1
 PER_DEVICE_EVAL_BATCH_SIZE=1
 GRADIENT_ACCUMULATION_STEPS=8
-LEARNING_RATE=2e-4
+LEARNING_RATE=2e-5
 WEIGHT_DECAY=0.01
 NUM_TRAIN_EPOCHS=1.0
 MAX_STEPS=-1
@@ -33,10 +34,21 @@ TRANSFORMER_LAYERS=2
 TRANSFORMER_HEADS=4
 TRANSFORMER_FFN_DIM=1024
 TRANSFORMER_MAX_POSITIONS=2048
+LORA_R=16
+LORA_ALPHA=32
+LORA_DROPOUT=0.05
+LORA_TARGET_MODULES="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+
+if [[ ! -f "${POLYGON_ADAPTER}" ]]; then
+  echo "Missing polygon adapter: ${POLYGON_ADAPTER}"
+  echo "Run: bash scripts/experiments/train_poly_transformer_stage1_encoder.sh"
+  exit 1
+fi
 
 "${PYTHON}" scripts/train_hiertext_paragraphs.py \
   --polygon-mode embedding \
   --polygon-encoder transformer \
+  --polygon-adapter "${POLYGON_ADAPTER}" \
   --model-dir "${MODEL_DIR}" \
   --train-jsonl "${TRAIN_JSONL}" \
   --eval-jsonl "${EVAL_JSONL}" \
@@ -63,4 +75,8 @@ TRANSFORMER_MAX_POSITIONS=2048
   --transformer-heads "${TRANSFORMER_HEADS}" \
   --transformer-ffn-dim "${TRANSFORMER_FFN_DIM}" \
   --transformer-max-positions "${TRANSFORMER_MAX_POSITIONS}" \
+  --lora-r "${LORA_R}" \
+  --lora-alpha "${LORA_ALPHA}" \
+  --lora-dropout "${LORA_DROPOUT}" \
+  --lora-target-modules "${LORA_TARGET_MODULES}" \
   --gradient-checkpointing

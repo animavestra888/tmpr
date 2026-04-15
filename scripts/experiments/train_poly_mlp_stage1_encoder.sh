@@ -8,7 +8,7 @@ PYTHON="python"
 MODEL_DIR="models/Qwen3-VL-2B-Instruct"
 TRAIN_JSONL="data/hiertext/jsonl_max300/train.jsonl"
 EVAL_JSONL="data/hiertext/jsonl_max300/validation.jsonl"
-OUTPUT_DIR="runs/hiertext_polygon_transformer_qwen3vl"
+OUTPUT_DIR="runs/hiertext_polygon_mlp_stage1_encoder"
 DEEPSPEED_CONFIG="configs/deepspeed_zero2.json"
 
 DEVICE="auto"
@@ -28,15 +28,11 @@ SAVE_STEPS=200
 EVAL_STEPS=200
 SAVE_TOTAL_LIMIT=2
 POLYGON_DROPOUT=0.1
-TRANSFORMER_D_MODEL=256
-TRANSFORMER_LAYERS=2
-TRANSFORMER_HEADS=4
-TRANSFORMER_FFN_DIM=1024
-TRANSFORMER_MAX_POSITIONS=2048
 
 "${PYTHON}" scripts/train_hiertext_paragraphs.py \
   --polygon-mode embedding \
-  --polygon-encoder transformer \
+  --polygon-encoder mlp \
+  --disable-lora \
   --model-dir "${MODEL_DIR}" \
   --train-jsonl "${TRAIN_JSONL}" \
   --eval-jsonl "${EVAL_JSONL}" \
@@ -58,9 +54,4 @@ TRANSFORMER_MAX_POSITIONS=2048
   --save-total-limit "${SAVE_TOTAL_LIMIT}" \
   --deepspeed "${DEEPSPEED_CONFIG}" \
   --polygon-dropout "${POLYGON_DROPOUT}" \
-  --transformer-d-model "${TRANSFORMER_D_MODEL}" \
-  --transformer-layers "${TRANSFORMER_LAYERS}" \
-  --transformer-heads "${TRANSFORMER_HEADS}" \
-  --transformer-ffn-dim "${TRANSFORMER_FFN_DIM}" \
-  --transformer-max-positions "${TRANSFORMER_MAX_POSITIONS}" \
   --gradient-checkpointing

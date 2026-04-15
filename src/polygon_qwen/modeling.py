@@ -446,7 +446,17 @@ class Qwen3VLPolygonModel(nn.Module):
             device=encoder_parameter.device,
             dtype=encoder_parameter.dtype,
         )
-        polygon_embeds = self.polygon_encoder(polygon_coords, polygon_counts=expected_counts)
+
+        encoder_is_frozen = not any(parameter.requires_grad for parameter in self.polygon_encoder.parameters())
+        if encoder_is_frozen:
+            was_training = self.polygon_encoder.training
+            self.polygon_encoder.eval()
+            with torch.no_grad():
+                polygon_embeds = self.polygon_encoder(polygon_coords, polygon_counts=expected_counts)
+            if was_training:
+                self.polygon_encoder.train()
+        else:
+            polygon_embeds = self.polygon_encoder(polygon_coords, polygon_counts=expected_counts)
 
         updated = inputs_embeds.clone()
         if polygon_embeds.ndim == 2:

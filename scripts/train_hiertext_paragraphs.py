@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import sys
 from pathlib import Path
 from typing import Any
 
 import torch
 from transformers import AutoModelForImageTextToText, AutoProcessor, Trainer, TrainingArguments
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from polygon_qwen.device import SUPPORTED_DEVICE_NAMES, resolve_device
 from polygon_qwen import (
@@ -39,6 +42,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exclude-illegible", action="store_true")
     parser.add_argument("--polygon-mode", choices=["text", "embedding"], default="text")
     parser.add_argument("--polygon-encoder", choices=["mlp", "transformer"], default="mlp")
+    parser.add_argument(
+        "--polygon-adapter",
+        type=Path,
+        default=None,
+        help="Path to polygon_adapter.pt, or to a checkpoint/final directory that contains it.",
+    )
+    parser.add_argument(
+        "--freeze-polygon-encoder",
+        action="store_true",
+        help="Keep the polygon encoder fixed after loading/building it. Useful for stage-2 LoRA training.",
+    )
     parser.add_argument("--poly-token", type=str, default="<poly>")
     parser.add_argument("--polygon-dropout", type=float, default=0.1)
     parser.add_argument("--transformer-d-model", type=int, default=256)
@@ -60,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-steps", type=int, default=200)
     parser.add_argument("--eval-steps", type=int, default=200)
     parser.add_argument("--save-total-limit", type=int, default=2)
+    parser.add_argument("--deepspeed", type=Path, default=None)
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--disable-lora", action="store_true")
     parser.add_argument("--train-base-model", action="store_true")
@@ -98,10 +113,13 @@ def configure_processor(processor: Any, *, max_pixels: int | None) -> None:
 
     image_processor = getattr(processor, "image_processor", None)
     if image_processor is not None and max_pixels is not None:
-        if hasattr(image_processor, "max_pixels"):
+        size = getattr(image_processor, "size", None)
+        if size is not None and getattr(size, "longest_edge", None) is not None:
+            size["longest_edge"] = max_pixels
+            if getattr(size, "shortest_edge", None) is not None and size["shortest_edge"] > max_pixels:
+                size["shortest_edge"] = max_pixels
+        elif hasattr(image_processor, "max_pixels"):
             image_processor.max_pixels = max_pixels
-        if hasattr(image_processor, "size") and isinstance(image_processor.size, dict):
-            image_processor.size["max_pixels"] = max_pixels
 
 
 def maybe_apply_lora(model: torch.nn.Module, args: argparse.Namespace) -> torch.nn.Module:
@@ -127,6 +145,52 @@ def maybe_apply_lora(model: torch.nn.Module, args: argparse.Namespace) -> torch.
     model = get_peft_model(model, config)
     model.print_trainable_parameters()
     return model
+
+
+def resolve_polygon_adapter_path(adapter_path: Path | None) -> Path | None:
+    if adapter_path is None:
+        return None
+    if adapter_path.is_dir():
+        adapter_path = adapter_path / "polygon_adapter.pt"
+    if not adapter_path.exists():
+        raise FileNotFoundError(f"Polygon adapter not found: {adapter_path}")
+    return adapter_path
+
+
+def load_polygon_adapter(model: Qwen3VLPolygonModel, adapter_path: Path) -> dict[str, Any]:
+    payload = torch.load(adapter_path, map_location="cpu")
+    saved_encoder_type = payload.get("polygon_encoder_type")
+    current_encoder_type = getattr(model.polygon_encoder, "encoder_type", None)
+    if saved_encoder_type is not None and current_encoder_type != saved_encoder_type:
+        raise ValueError(
+            "Polygon adapter encoder type mismatch: "
+            f"checkpoint has '{saved_encoder_type}', current model uses '{current_encoder_type}'."
+        )
+
+    saved_config = payload.get("polygon_encoder_config", {})
+    current_config = (
+        model.polygon_encoder.config_dict()
+        if hasattr(model.polygon_encoder, "config_dict")
+        else {}
+    )
+    ignored_config_keys = {"dropout"}
+    mismatches = [
+        f"{key}: checkpoint={saved_config[key]!r}, current={current_config[key]!r}"
+        for key in saved_config.keys() & current_config.keys()
+        if key not in ignored_config_keys and saved_config[key] != current_config[key]
+    ]
+    if mismatches:
+        mismatch_text = "; ".join(mismatches)
+        raise ValueError(f"Polygon adapter config mismatch: {mismatch_text}")
+
+    model.polygon_encoder.load_state_dict(payload["polygon_encoder"])
+    print(f"loaded polygon adapter: {adapter_path}")
+    return payload
+
+
+def set_module_trainable(module: torch.nn.Module, *, trainable: bool) -> None:
+    for parameter in module.parameters():
+        parameter.requires_grad = trainable
 
 
 def print_trainable_summary(model: torch.nn.Module) -> None:
@@ -159,6 +223,8 @@ def build_training_args(args: argparse.Namespace, *, dtype: torch.dtype, device:
         "dataloader_num_workers": 0,
         "optim": "adamw_torch",
     }
+    if args.deepspeed is not None:
+        kwargs["deepspeed"] = str(args.deepspeed)
     if "use_cpu" in inspect.signature(TrainingArguments.__init__).parameters:
         kwargs["use_cpu"] = device.type == "cpu"
     return TrainingArguments(**kwargs)
@@ -184,6 +250,11 @@ def main() -> None:
     print(f"device: {device}")
 
     use_polygon_embeddings = args.polygon_mode == "embedding"
+    if args.polygon_adapter is not None and not use_polygon_embeddings:
+        raise ValueError("--polygon-adapter can only be used with --polygon-mode embedding.")
+    if args.freeze_polygon_encoder and not use_polygon_embeddings:
+        raise ValueError("--freeze-polygon-encoder can only be used with --polygon-mode embedding.")
+
     if use_polygon_embeddings:
         model = Qwen3VLPolygonModel.from_pretrained(
             str(args.model_dir),
@@ -198,6 +269,9 @@ def main() -> None:
             transformer_ffn_dim=args.transformer_ffn_dim,
             transformer_max_positions=args.transformer_max_positions,
         )
+        adapter_path = resolve_polygon_adapter_path(args.polygon_adapter)
+        if adapter_path is not None:
+            load_polygon_adapter(model, adapter_path)
         processor = model.processor
         configure_processor(processor, max_pixels=args.max_pixels)
         model.base_model.config.use_cache = False
@@ -209,6 +283,9 @@ def main() -> None:
                 model.base_model.config.use_cache = False
         if not args.disable_lora:
             model.base_model = maybe_apply_lora(model.base_model, args)
+        if args.freeze_polygon_encoder:
+            set_module_trainable(model.polygon_encoder, trainable=False)
+            print("polygon encoder frozen")
         if args.device != "auto":
             model.to(device)
     else:

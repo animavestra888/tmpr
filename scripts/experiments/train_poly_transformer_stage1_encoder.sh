@@ -8,7 +8,7 @@ PYTHON="python"
 MODEL_DIR="models/Qwen3-VL-2B-Instruct"
 TRAIN_JSONL="data/hiertext/jsonl_max300/train.jsonl"
 EVAL_JSONL="data/hiertext/jsonl_max300/validation.jsonl"
-OUTPUT_DIR="runs/hiertext_polygon_transformer_qwen3vl"
+OUTPUT_DIR="runs/hiertext_polygon_transformer_stage1_encoder"
 DEEPSPEED_CONFIG="configs/deepspeed_zero2.json"
 
 DEVICE="auto"
@@ -37,6 +37,7 @@ TRANSFORMER_MAX_POSITIONS=2048
 "${PYTHON}" scripts/train_hiertext_paragraphs.py \
   --polygon-mode embedding \
   --polygon-encoder transformer \
+  --disable-lora \
   --model-dir "${MODEL_DIR}" \
   --train-jsonl "${TRAIN_JSONL}" \
   --eval-jsonl "${EVAL_JSONL}" \

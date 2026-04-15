@@ -1,10 +1,15 @@
 #!/bin/bash
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 
 PYTHON="python"
 MODEL_DIR="models/Qwen3-VL-2B-Instruct"
 TRAIN_JSONL="data/hiertext/jsonl_max300/train.jsonl"
 EVAL_JSONL="data/hiertext/jsonl_max300/validation.jsonl"
 OUTPUT_DIR="runs/hiertext_text_bbox_qwen3vl"
+DEEPSPEED_CONFIG="configs/deepspeed_zero2.json"
 
 DEVICE="auto"
 DTYPE="bfloat16"
@@ -44,4 +49,5 @@ SAVE_TOTAL_LIMIT=2
   --save-steps "${SAVE_STEPS}" \
   --eval-steps "${EVAL_STEPS}" \
   --save-total-limit "${SAVE_TOTAL_LIMIT}" \
+  --deepspeed "${DEEPSPEED_CONFIG}" \
   --gradient-checkpointing

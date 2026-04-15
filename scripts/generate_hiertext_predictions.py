@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 import torch
 from transformers import AutoModelForImageTextToText, AutoProcessor
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from polygon_qwen import (
     HierTextParagraphClusteringDataset,
@@ -65,10 +68,13 @@ def configure_processor(processor: Any, *, max_pixels: int | None) -> None:
 
     image_processor = getattr(processor, "image_processor", None)
     if image_processor is not None and max_pixels is not None:
-        if hasattr(image_processor, "max_pixels"):
+        size = getattr(image_processor, "size", None)
+        if size is not None and getattr(size, "longest_edge", None) is not None:
+            size["longest_edge"] = max_pixels
+            if getattr(size, "shortest_edge", None) is not None and size["shortest_edge"] > max_pixels:
+                size["shortest_edge"] = max_pixels
+        elif hasattr(image_processor, "max_pixels"):
             image_processor.max_pixels = max_pixels
-        if hasattr(image_processor, "size") and isinstance(image_processor.size, dict):
-            image_processor.size["max_pixels"] = max_pixels
 
 
 def load_qwen_model(model_dir: Path, *, dtype: torch.dtype) -> torch.nn.Module:
