@@ -1,4 +1,8 @@
 #!/bin/bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 
 HIER_ROOT="data/hiertext"
 HIER_REPO="${HIER_ROOT}/repo"

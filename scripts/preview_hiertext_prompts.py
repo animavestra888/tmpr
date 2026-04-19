@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from polygon_qwen import HierTextParagraphClusteringDataset
+from polygon_qwen import EMBEDDING_GEOMETRIES, HierTextParagraphClusteringDataset
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bbox-scale", type=int, default=1000)
     parser.add_argument("--exclude-illegible", action="store_true")
     parser.add_argument("--polygon-mode", choices=["text", "embedding"], default="text")
+    parser.add_argument("--embedding-geometry", choices=list(EMBEDDING_GEOMETRIES), default="bbox_corners")
     parser.add_argument("--poly-token", type=str, default="<poly>")
     parser.add_argument("--output-jsonl", type=Path, default=None)
     return parser.parse_args()
@@ -36,6 +37,7 @@ def main() -> None:
         limit=args.limit,
         include_illegible=not args.exclude_illegible,
         polygon_mode=args.polygon_mode,
+        embedding_geometry=args.embedding_geometry,
         poly_token=args.poly_token,
         coord_precision=args.coord_precision,
         bbox_scale=args.bbox_scale,

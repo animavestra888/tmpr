@@ -12,11 +12,15 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from polygon_qwen import (
+    EMBEDDING_GEOMETRIES,
     HierTextParagraphClusteringDataset,
     Qwen3VLPolygonModel,
+    coord_format_to_embedding_geometry,
+    embedding_geometry_to_coord_format,
     evaluate_pointer_outputs,
 )
 from polygon_qwen.device import SUPPORTED_DEVICE_NAMES, resolve_device
+from polygon_qwen.processor import configure_processor
 
 try:
     from transformers import Qwen3VLForConditionalGeneration
@@ -32,6 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--path-root", type=Path, default=Path("."))
     parser.add_argument("--output-jsonl", type=Path, required=True)
     parser.add_argument("--polygon-mode", choices=["text", "embedding"], default="text")
+    parser.add_argument(
+        "--embedding-geometry",
+        choices=["auto", *EMBEDDING_GEOMETRIES],
+        default="auto",
+        help="Geometry representation used for learned <poly> embeddings. auto uses the adapter config when available.",
+    )
     parser.add_argument("--polygon-encoder", choices=["auto", "mlp", "transformer"], default="auto")
     parser.add_argument("--poly-token", type=str, default="<poly>")
     parser.add_argument("--polygon-dropout", type=float, default=0.1)
@@ -60,23 +70,6 @@ def resolve_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
-def configure_processor(processor: Any, *, max_pixels: int | None) -> None:
-    if hasattr(processor, "tokenizer"):
-        processor.tokenizer.padding_side = "right"
-        if processor.tokenizer.pad_token is None:
-            processor.tokenizer.pad_token = processor.tokenizer.eos_token
-
-    image_processor = getattr(processor, "image_processor", None)
-    if image_processor is not None and max_pixels is not None:
-        size = getattr(image_processor, "size", None)
-        if size is not None and getattr(size, "longest_edge", None) is not None:
-            size["longest_edge"] = max_pixels
-            if getattr(size, "shortest_edge", None) is not None and size["shortest_edge"] > max_pixels:
-                size["shortest_edge"] = max_pixels
-        elif hasattr(image_processor, "max_pixels"):
-            image_processor.max_pixels = max_pixels
-
-
 def load_qwen_model(model_dir: Path, *, dtype: torch.dtype) -> torch.nn.Module:
     model_cls: Any = Qwen3VLForConditionalGeneration or AutoModelForImageTextToText
     return model_cls.from_pretrained(str(model_dir), torch_dtype=dtype)
@@ -96,16 +89,6 @@ def maybe_load_lora(model: torch.nn.Module, checkpoint_dir: Path | None) -> torc
     return PeftModel.from_pretrained(model, str(lora_dir))
 
 
-def maybe_load_polygon_adapter(model: Qwen3VLPolygonModel, checkpoint_dir: Path | None) -> None:
-    if checkpoint_dir is None:
-        return
-    adapter_path = checkpoint_dir / "polygon_adapter.pt"
-    if not adapter_path.exists():
-        return
-    adapter = torch.load(adapter_path, map_location="cpu")
-    model.polygon_encoder.load_state_dict(adapter["polygon_encoder"])
-
-
 def load_polygon_adapter_payload(checkpoint_dir: Path | None) -> dict[str, Any] | None:
     if checkpoint_dir is None:
         return None
@@ -113,6 +96,10 @@ def load_polygon_adapter_payload(checkpoint_dir: Path | None) -> dict[str, Any] 
     if not adapter_path.exists():
         return None
     return torch.load(adapter_path, map_location="cpu")
+
+
+def load_polygon_encoder_state(model: Qwen3VLPolygonModel, adapter_payload: dict[str, Any]) -> None:
+    model.polygon_encoder.load_state_dict(adapter_payload["polygon_encoder"])
 
 
 def resolve_polygon_encoder_args(
@@ -136,6 +123,27 @@ def resolve_polygon_encoder_args(
             args.transformer_max_positions,
         ),
     }
+
+
+def resolve_embedding_geometry(
+    args: argparse.Namespace,
+    adapter_payload: dict[str, Any] | None,
+) -> str:
+    adapter_config = adapter_payload.get("polygon_encoder_config", {}) if adapter_payload else {}
+    adapter_coord_format = adapter_config.get("coord_format")
+    adapter_geometry = (
+        coord_format_to_embedding_geometry(str(adapter_coord_format))
+        if adapter_coord_format is not None
+        else None
+    )
+    if args.embedding_geometry == "auto":
+        return adapter_geometry or "bbox_corners"
+    if adapter_geometry is not None and args.embedding_geometry != adapter_geometry:
+        raise ValueError(
+            "Embedding geometry mismatch: "
+            f"checkpoint uses {adapter_geometry!r}, but --embedding-geometry={args.embedding_geometry!r}."
+        )
+    return args.embedding_geometry
 
 
 def build_prompt(processor: Any, prompt: str) -> str:
@@ -233,6 +241,17 @@ def generate_embedding_prediction(
             polygon_coords=polygon_coords,
             polygon_counts=polygon_counts,
         )
+        position_ids = model._compute_position_ids(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=batch.get("attention_mask"),
+            image_grid_thw=batch.get("image_grid_thw"),
+            video_grid_thw=batch.get("video_grid_thw"),
+            second_per_grid_ts=batch.get("second_per_grid_ts"),
+            mm_token_type_ids=batch.get("mm_token_type_ids"),
+        )
+        if position_ids is not None:
+            batch["position_ids"] = position_ids
         output_ids = model.base_model.generate(
             inputs_embeds=inputs_embeds,
             **batch,
@@ -250,29 +269,34 @@ def main() -> None:
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype)
 
+    adapter_payload = load_polygon_adapter_payload(args.checkpoint_dir) if args.polygon_mode == "embedding" else None
+    embedding_geometry = resolve_embedding_geometry(args, adapter_payload)
+    coord_format = embedding_geometry_to_coord_format(embedding_geometry)
+
     dataset = HierTextParagraphClusteringDataset(
         jsonl_path=args.jsonl_path,
         path_root=args.path_root,
         limit=args.max_samples,
         polygon_mode=args.polygon_mode,
+        embedding_geometry=embedding_geometry,
         poly_token=args.poly_token,
         coord_precision=args.coord_precision,
         bbox_scale=args.bbox_scale,
     )
 
     if args.polygon_mode == "embedding":
-        adapter_payload = load_polygon_adapter_payload(args.checkpoint_dir)
         encoder_args = resolve_polygon_encoder_args(args, adapter_payload)
         model = Qwen3VLPolygonModel.from_pretrained(
             str(args.model_dir),
             poly_token=args.poly_token,
             torch_dtype=dtype,
             freeze_base_model=True,
+            coord_format=coord_format,
             **encoder_args,
         )
         configure_processor(model.processor, max_pixels=args.max_pixels)
         if adapter_payload is not None:
-            model.polygon_encoder.load_state_dict(adapter_payload["polygon_encoder"])
+            load_polygon_encoder_state(model, adapter_payload)
         model.base_model = maybe_load_lora(model.base_model, args.checkpoint_dir)
         model.to(device)
         model.eval()

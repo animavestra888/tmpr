@@ -7,16 +7,19 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from transformers import AutoModelForImageTextToText, AutoProcessor, Trainer, TrainingArguments
+from transformers import AutoModelForImageTextToText, AutoProcessor, Trainer, TrainingArguments, set_seed
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from polygon_qwen.device import SUPPORTED_DEVICE_NAMES, resolve_device
 from polygon_qwen import (
+    EMBEDDING_GEOMETRIES,
     HierTextParagraphClusteringDataset,
     HierTextParagraphCollator,
     Qwen3VLPolygonModel,
+    embedding_geometry_to_coord_format,
 )
+from polygon_qwen.processor import configure_processor
 
 try:
     from transformers import Qwen3VLForConditionalGeneration
@@ -41,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bbox-scale", type=int, default=1000)
     parser.add_argument("--exclude-illegible", action="store_true")
     parser.add_argument("--polygon-mode", choices=["text", "embedding"], default="text")
+    parser.add_argument(
+        "--embedding-geometry",
+        choices=list(EMBEDDING_GEOMETRIES),
+        default="bbox_corners",
+        help="Geometry representation used for learned <poly> embeddings.",
+    )
     parser.add_argument("--polygon-encoder", choices=["mlp", "transformer"], default="mlp")
     parser.add_argument(
         "--polygon-adapter",
@@ -82,6 +91,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pixels", type=int, default=262144)
     parser.add_argument("--device", choices=SUPPORTED_DEVICE_NAMES, default="auto")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--data-seed", type=int, default=42)
+    parser.add_argument(
+        "--full-determinism",
+        action="store_true",
+        help="Ask Transformers/PyTorch to use deterministic algorithms where supported. Can be slower.",
+    )
     parser.add_argument("--per-device-train-batch-size", type=int, default=1)
     parser.add_argument("--per-device-eval-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
@@ -93,6 +109,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-steps", type=int, default=200)
     parser.add_argument("--eval-steps", type=int, default=200)
     parser.add_argument("--save-total-limit", type=int, default=2)
+    parser.add_argument("--disable-load-best-model-at-end", action="store_true")
     parser.add_argument("--deepspeed", type=Path, default=None)
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--disable-lora", action="store_true")
@@ -122,23 +139,6 @@ def resolve_dtype(name: str) -> torch.dtype:
 def load_qwen_model(model_dir: Path, *, dtype: torch.dtype) -> torch.nn.Module:
     model_cls: Any = Qwen3VLForConditionalGeneration or AutoModelForImageTextToText
     return model_cls.from_pretrained(str(model_dir), torch_dtype=dtype)
-
-
-def configure_processor(processor: Any, *, max_pixels: int | None) -> None:
-    if hasattr(processor, "tokenizer"):
-        processor.tokenizer.padding_side = "right"
-        if processor.tokenizer.pad_token is None:
-            processor.tokenizer.pad_token = processor.tokenizer.eos_token
-
-    image_processor = getattr(processor, "image_processor", None)
-    if image_processor is not None and max_pixels is not None:
-        size = getattr(image_processor, "size", None)
-        if size is not None and getattr(size, "longest_edge", None) is not None:
-            size["longest_edge"] = max_pixels
-            if getattr(size, "shortest_edge", None) is not None and size["shortest_edge"] > max_pixels:
-                size["shortest_edge"] = max_pixels
-        elif hasattr(image_processor, "max_pixels"):
-            image_processor.max_pixels = max_pixels
 
 
 def maybe_apply_lora(model: torch.nn.Module, args: argparse.Namespace) -> torch.nn.Module:
@@ -220,13 +220,13 @@ def load_polygon_adapter(model: Qwen3VLPolygonModel, adapter_path: Path) -> dict
         raise ValueError(
             "Polygon adapter coordinate dimension mismatch: "
             f"checkpoint has {saved_coord_dim}, current model uses {current_coord_dim}. "
-            "Current bbox-corner adapters use 8 coordinates."
+            "Current learned geometry adapters use 8 coordinates."
         )
     if saved_coord_dim == current_coord_dim and saved_coord_format != current_coord_format:
         raise ValueError(
             "Polygon adapter coordinate format mismatch: "
             f"checkpoint has {saved_coord_format!r}, current model uses {current_coord_format!r}. "
-            "Retrain the polygon adapter for axis-aligned bbox corners."
+            "Retrain the polygon adapter for this embedding geometry."
         )
     ignored_config_keys = {"dropout"}
     mismatches = [
@@ -234,9 +234,15 @@ def load_polygon_adapter(model: Qwen3VLPolygonModel, adapter_path: Path) -> dict
         for key in saved_config.keys() & current_config.keys()
         if key not in ignored_config_keys and saved_config[key] != current_config[key]
     ]
+    missing_config_keys = [
+        key
+        for key in current_config.keys() - saved_config.keys()
+    ]
     if mismatches:
         mismatch_text = "; ".join(mismatches)
         raise ValueError(f"Polygon adapter config mismatch: {mismatch_text}")
+    if missing_config_keys:
+        raise ValueError(f"Polygon adapter is missing config keys: {missing_config_keys}")
 
     model.polygon_encoder.load_state_dict(payload["polygon_encoder"])
     if "poly_detection_head" in payload:
@@ -261,6 +267,13 @@ def print_trainable_summary(model: torch.nn.Module) -> None:
 
 
 def build_training_args(args: argparse.Namespace, *, dtype: torch.dtype, device: torch.device, has_eval: bool) -> TrainingArguments:
+    load_best_model_at_end = has_eval and not args.disable_load_best_model_at_end
+    if load_best_model_at_end and args.save_steps != args.eval_steps:
+        raise ValueError(
+            "--save-steps must equal --eval-steps when loading the best model at end. "
+            "Either make them equal or pass --disable-load-best-model-at-end."
+        )
+
     kwargs: dict[str, Any] = {
         "output_dir": str(args.output_dir),
         "per_device_train_batch_size": args.per_device_train_batch_size,
@@ -273,16 +286,29 @@ def build_training_args(args: argparse.Namespace, *, dtype: torch.dtype, device:
         "logging_steps": args.logging_steps,
         "save_steps": args.save_steps,
         "save_total_limit": args.save_total_limit,
+        "save_strategy": "steps",
         "eval_strategy": "steps" if has_eval else "no",
         "eval_steps": args.eval_steps if has_eval else None,
         "fp16": dtype == torch.float16,
         "bf16": dtype == torch.bfloat16,
+        "seed": args.seed,
+        "data_seed": args.data_seed,
         "gradient_checkpointing": args.gradient_checkpointing,
         "remove_unused_columns": False,
         "report_to": "none",
         "dataloader_num_workers": 0,
         "optim": "adamw_torch",
     }
+    if load_best_model_at_end:
+        kwargs.update(
+            {
+                "load_best_model_at_end": True,
+                "metric_for_best_model": "eval_loss",
+                "greater_is_better": False,
+            }
+        )
+    if "full_determinism" in inspect.signature(TrainingArguments.__init__).parameters:
+        kwargs["full_determinism"] = args.full_determinism
     if args.deepspeed is not None:
         kwargs["deepspeed"] = str(args.deepspeed)
     if "use_cpu" in inspect.signature(TrainingArguments.__init__).parameters:
@@ -305,6 +331,7 @@ class PolygonEmbeddingTrainer(Trainer):
 
 def main() -> None:
     args = parse_args()
+    set_seed(args.seed, deterministic=args.full_determinism)
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype)
     print(f"device: {device}")
@@ -316,6 +343,7 @@ def main() -> None:
         raise ValueError("--freeze-polygon-encoder can only be used with --polygon-mode embedding.")
     if args.poly_det_loss_weight > 0.0 and not use_polygon_embeddings:
         raise ValueError("--poly-det-loss-weight can only be used with --polygon-mode embedding.")
+    coord_format = embedding_geometry_to_coord_format(args.embedding_geometry)
 
     if use_polygon_embeddings:
         model = Qwen3VLPolygonModel.from_pretrained(
@@ -330,6 +358,7 @@ def main() -> None:
             transformer_heads=args.transformer_heads,
             transformer_ffn_dim=args.transformer_ffn_dim,
             transformer_max_positions=args.transformer_max_positions,
+            coord_format=coord_format,
             poly_detection_loss_weight=args.poly_det_loss_weight,
             poly_detection_loss_type=args.poly_det_loss_type,
             poly_detection_source=args.poly_det_source,
@@ -380,6 +409,7 @@ def main() -> None:
         limit=args.max_train_samples,
         include_illegible=not args.exclude_illegible,
         polygon_mode=args.polygon_mode,
+        embedding_geometry=args.embedding_geometry,
         poly_token=args.poly_token,
         coord_precision=args.coord_precision,
         bbox_scale=args.bbox_scale,
@@ -394,6 +424,7 @@ def main() -> None:
             limit=args.max_eval_samples,
             include_illegible=not args.exclude_illegible,
             polygon_mode=args.polygon_mode,
+            embedding_geometry=args.embedding_geometry,
             poly_token=args.poly_token,
             coord_precision=args.coord_precision,
             bbox_scale=args.bbox_scale,

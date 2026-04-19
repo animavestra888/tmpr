@@ -4,12 +4,15 @@ import argparse
 import colorsys
 import json
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
-import cv2
-import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from polygon_qwen.geometry import polygon_to_minrect_8coords
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,25 +70,22 @@ def scale_polygon(polygon: list[list[float]], scale: float) -> list[tuple[float,
     return [(float(x) * scale, float(y) * scale) for x, y in polygon]
 
 
-def order_box_corners(points: np.ndarray) -> np.ndarray:
-    box = np.asarray(points, dtype=np.float32)
-    if box.shape != (4, 2):
-        raise ValueError(f"Expected box corners with shape (4, 2), received {box.shape}.")
-
-    center = box.mean(axis=0)
-    angles = np.arctan2(box[:, 1] - center[1], box[:, 0] - center[0])
-    ordered = box[np.argsort(angles)]
-    start_index = int(np.argmin(ordered[:, 1] + ordered[:, 0]))
-    return np.roll(ordered, -start_index, axis=0).astype(np.float32)
-
-
-def min_area_rect(points_xy: list[list[float]]) -> list[tuple[float, float]]:
-    points = np.asarray(points_xy, dtype=np.float32)
-    if points.ndim != 2 or points.shape[0] < 3 or points.shape[1] != 2:
-        raise ValueError(f"Expected at least three xy points, received shape {points.shape}.")
-    rect = cv2.minAreaRect(points)
-    box = cv2.boxPoints(rect).astype(np.float32)
-    return [(float(x), float(y)) for x, y in order_box_corners(box)]
+def min_area_rect(
+    points_xy: list[list[float]],
+    *,
+    image_width: int,
+    image_height: int,
+) -> list[tuple[float, float]]:
+    coords = polygon_to_minrect_8coords(
+        points_xy,
+        image_width=image_width,
+        image_height=image_height,
+        clip=False,
+    )
+    return [
+        (float(coords[index] * image_width), float(coords[index + 1] * image_height))
+        for index in range(0, len(coords), 2)
+    ]
 
 
 def draw_record(
@@ -100,6 +100,7 @@ def draw_record(
     image_path = resolve_image_path(path_root, str(record["img_path"]))
     with Image.open(image_path) as image:
         image = image.convert("RGB")
+        original_width, original_height = image.size
         image, scale = resize_for_view(image, max_image_side=max_image_side)
 
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
@@ -122,7 +123,14 @@ def draw_record(
     cluster_rect_width = max(line_width + 1, round(max(image.size) / 420))
     for paragraph_id, points_xy in cluster_points.items():
         color = cluster_color(paragraph_id)
-        rect_points = scale_polygon(min_area_rect(points_xy), scale=scale)
+        rect_points = scale_polygon(
+            min_area_rect(
+                points_xy,
+                image_width=original_width,
+                image_height=original_height,
+            ),
+            scale=scale,
+        )
         fill = color[:3] + (38,)
         outline = color[:3] + (210,)
         draw.polygon(rect_points, fill=fill)

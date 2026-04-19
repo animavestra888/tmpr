@@ -11,7 +11,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from .geometry import polygon_to_bbox_2d, polygon_to_normalized_bbox_8coords
+from .geometry import EMBEDDING_GEOMETRIES, polygon_to_bbox_2d, polygon_to_embedding_coords
 
 BBOX_COORD_DIM = 8
 
@@ -93,6 +93,7 @@ class HierTextParagraphClusteringDataset(Dataset):
         limit: int | None = None,
         include_illegible: bool = True,
         polygon_mode: str = "text",
+        embedding_geometry: str = "bbox_corners",
         poly_token: str = "<poly>",
         coord_precision: int = 4,
         bbox_scale: int = 1000,
@@ -108,6 +109,10 @@ class HierTextParagraphClusteringDataset(Dataset):
         if polygon_mode not in {"text", "embedding"}:
             raise ValueError("polygon_mode must be either 'text' or 'embedding'.")
         self.polygon_mode = polygon_mode
+        if embedding_geometry not in EMBEDDING_GEOMETRIES:
+            choices = ", ".join(EMBEDDING_GEOMETRIES)
+            raise ValueError(f"embedding_geometry must be one of: {choices}.")
+        self.embedding_geometry = embedding_geometry
         self.poly_token = poly_token
         self.coord_precision = coord_precision
         self.bbox_scale = bbox_scale
@@ -252,7 +257,7 @@ class HierTextParagraphClusteringDataset(Dataset):
                     {
                         "id": int(line.line_id),
                         "text": line.text,
-                        "bbox_2d": self.poly_token,
+                        "polygon": self.poly_token,
                     }
                 )
             else:
@@ -266,9 +271,8 @@ class HierTextParagraphClusteringDataset(Dataset):
 
         if self.polygon_mode == "embedding":
             geometry_description = (
-                "Each line has a stable id, recognized text when present, and bbox_2d. "
-                "The bbox_2d placeholder is replaced by a learned embedding of that line's "
-                "normalized four-corner axis-aligned bbox geometry."
+                "Each line has a stable id, recognized text when present, and a polygon. "
+                "The polygon placeholder is replaced by a learned embedding of that line's normalized geometry."
             )
         else:
             geometry_description = (
@@ -310,10 +314,11 @@ class HierTextParagraphClusteringDataset(Dataset):
         width, height = image.size
 
         for line in lines:
-            coords = polygon_to_normalized_bbox_8coords(
+            coords = polygon_to_embedding_coords(
                 line.vertices,
                 image_width=width,
                 image_height=height,
+                embedding_geometry=self.embedding_geometry,
             )
             line.coords = _round_coords(coords, self.coord_precision)
             line.bbox_2d = polygon_to_bbox_2d(

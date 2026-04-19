@@ -3,36 +3,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+source scripts/experiments/common_train_params.sh
 
-PYTHON="python"
-MODEL_DIR="models/Qwen3-VL-2B-Instruct"
-TRAIN_JSONL="data/hiertext/jsonl_max300/train.jsonl"
-EVAL_JSONL="data/hiertext/jsonl_max300/validation.jsonl"
-POLYGON_ADAPTER="runs/hiertext_polygon_mlp_stage1_encoder/final/polygon_adapter.pt"
-OUTPUT_DIR="runs/hiertext_polygon_mlp_stage2_lora"
-DEEPSPEED_CONFIG="configs/deepspeed_zero2.json"
-
-DEVICE="auto"
-DTYPE="bfloat16"
-MAX_PIXELS=327680
-MAX_EVAL_SAMPLES=128
-
-PER_DEVICE_TRAIN_BATCH_SIZE=1
-PER_DEVICE_EVAL_BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=8
-LEARNING_RATE=2e-5
-WEIGHT_DECAY=0.01
-NUM_TRAIN_EPOCHS=1.0
-MAX_STEPS=-1
-LOGGING_STEPS=10
-SAVE_STEPS=200
-EVAL_STEPS=200
-SAVE_TOTAL_LIMIT=2
-POLYGON_DROPOUT=0.1
-LORA_R=16
-LORA_ALPHA=32
-LORA_DROPOUT=0.05
-LORA_TARGET_MODULES="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+: "${POLYGON_ADAPTER:=runs/hiertext_polygon_mlp_stage1_encoder/final/polygon_adapter.pt}"
+: "${OUTPUT_DIR:=runs/hiertext_polygon_mlp_stage2_lora}"
+: "${LEARNING_RATE:=2e-5}"
+set_common_train_defaults
+set_polygon_embedding_defaults
+set_lora_defaults
+set_reproducibility_args
 
 if [[ ! -f "${POLYGON_ADAPTER}" ]]; then
   echo "Missing polygon adapter: ${POLYGON_ADAPTER}"
@@ -42,6 +21,7 @@ fi
 
 "${PYTHON}" scripts/train_hiertext_paragraphs.py \
   --polygon-mode embedding \
+  --embedding-geometry "${EMBEDDING_GEOMETRY}" \
   --polygon-encoder mlp \
   --polygon-adapter "${POLYGON_ADAPTER}" \
   --model-dir "${MODEL_DIR}" \
@@ -52,6 +32,8 @@ fi
   --max-pixels "${MAX_PIXELS}" \
   --device "${DEVICE}" \
   --dtype "${DTYPE}" \
+  --seed "${SEED}" \
+  --data-seed "${DATA_SEED}" \
   --per-device-train-batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}" \
   --per-device-eval-batch-size "${PER_DEVICE_EVAL_BATCH_SIZE}" \
   --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS}" \
@@ -69,4 +51,5 @@ fi
   --lora-alpha "${LORA_ALPHA}" \
   --lora-dropout "${LORA_DROPOUT}" \
   --lora-target-modules "${LORA_TARGET_MODULES}" \
-  --gradient-checkpointing
+  --gradient-checkpointing \
+  "${TRAIN_EXTRA_ARGS[@]}"

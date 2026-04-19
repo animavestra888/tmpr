@@ -9,6 +9,7 @@ MODEL_DIR="models/Qwen3-VL-2B-Instruct"
 CHECKPOINT_DIR="runs/hiertext_polygon_mlp_qwen3vl/final"
 TEST_JSONL="data/hiertext/jsonl_max300/test.jsonl"
 OUTPUT_JSONL="runs/test_predictions_poly_mlp.jsonl"
+EMBEDDING_GEOMETRY="auto"
 
 DEVICE="auto"
 DTYPE="bfloat16"
@@ -18,6 +19,7 @@ MAX_NEW_TOKENS=192
 
 "${PYTHON}" scripts/generate_hiertext_predictions.py \
   --polygon-mode embedding \
+  --embedding-geometry "${EMBEDDING_GEOMETRY}" \
   --polygon-encoder auto \
   --model-dir "${MODEL_DIR}" \
   --checkpoint-dir "${CHECKPOINT_DIR}" \

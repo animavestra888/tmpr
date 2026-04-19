@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover - depends on transformers version
     Qwen3VLForConditionalGeneration = None
 
 BBOX_COORD_DIM = 8
-BBOX_COORD_FORMAT = "bbox_corners_xyxy"
+DEFAULT_COORD_FORMAT = "bbox_corners_xyxy"
 
 
 def _call_with_supported_kwargs(fn: Any, **kwargs: Any) -> Any:
@@ -101,21 +101,25 @@ def _ensure_poly_token(processor: Any, model: nn.Module, poly_token: str) -> int
 class PolygonMLPEncoder(nn.Module):
     encoder_type = "mlp"
 
-    def __init__(self, out_dim: int = 2048, dropout: float = 0.1, coord_dim: int = BBOX_COORD_DIM) -> None:
+    def __init__(
+        self,
+        out_dim: int = 2048,
+        dropout: float = 0.1,
+        coord_dim: int = BBOX_COORD_DIM,
+        coord_format: str = DEFAULT_COORD_FORMAT,
+    ) -> None:
         super().__init__()
         self.out_dim = out_dim
         self.dropout = dropout
         self.coord_dim = coord_dim
+        self.coord_format = coord_format
         self.net = nn.Sequential(
             nn.Linear(coord_dim, 256),
             nn.GELU(),
             nn.LayerNorm(256),
             nn.Dropout(dropout),
-            nn.Linear(256, 1024),
-            nn.GELU(),
-            nn.LayerNorm(1024),
-            nn.Dropout(dropout),
-            nn.Linear(1024, out_dim),
+            nn.Linear(256, out_dim),
+            nn.LayerNorm(out_dim)
         )
 
     def forward(
@@ -138,7 +142,8 @@ class PolygonMLPEncoder(nn.Module):
             "out_dim": self.out_dim,
             "dropout": self.dropout,
             "coord_dim": self.coord_dim,
-            "coord_format": BBOX_COORD_FORMAT,
+            "coord_format": self.coord_format,
+            "output_norm": "layer_norm",
         }
 
 
@@ -156,6 +161,7 @@ class PolygonLayoutTransformerEncoder(nn.Module):
         dropout: float = 0.1,
         max_position_embeddings: int = 2048,
         coord_dim: int = BBOX_COORD_DIM,
+        coord_format: str = DEFAULT_COORD_FORMAT,
     ) -> None:
         super().__init__()
         self.out_dim = out_dim
@@ -166,6 +172,7 @@ class PolygonLayoutTransformerEncoder(nn.Module):
         self.dropout = dropout
         self.max_position_embeddings = max_position_embeddings
         self.coord_dim = coord_dim
+        self.coord_format = coord_format
 
         self.coord_projection = nn.Linear(coord_dim, d_model)
         self.coord_norm = nn.LayerNorm(d_model)
@@ -250,7 +257,7 @@ class PolygonLayoutTransformerEncoder(nn.Module):
             "dropout": self.dropout,
             "max_position_embeddings": self.max_position_embeddings,
             "coord_dim": self.coord_dim,
-            "coord_format": BBOX_COORD_FORMAT,
+            "coord_format": self.coord_format,
         }
 
 
@@ -264,9 +271,14 @@ def build_polygon_encoder(
     transformer_heads: int = 4,
     transformer_ffn_dim: int = 1024,
     transformer_max_positions: int = 2048,
+    coord_format: str = DEFAULT_COORD_FORMAT,
 ) -> nn.Module:
     if encoder_type == "mlp":
-        return PolygonMLPEncoder(out_dim=hidden_size, dropout=dropout)
+        return PolygonMLPEncoder(
+            out_dim=hidden_size,
+            dropout=dropout,
+            coord_format=coord_format,
+        )
     if encoder_type == "transformer":
         return PolygonLayoutTransformerEncoder(
             out_dim=hidden_size,
@@ -276,12 +288,13 @@ def build_polygon_encoder(
             dim_feedforward=transformer_ffn_dim,
             dropout=dropout,
             max_position_embeddings=transformer_max_positions,
+            coord_format=coord_format,
         )
     raise ValueError("polygon_encoder_type must be either 'mlp' or 'transformer'.")
 
 
 class PolygonDetectionHead(nn.Module):
-    """Predict normalized four-corner axis-aligned bbox coordinates."""
+    """Predict normalized 8-coordinate geometry used by the learned adapter."""
 
     def __init__(
         self,
@@ -289,6 +302,7 @@ class PolygonDetectionHead(nn.Module):
         hidden_dim: int | None = None,
         dropout: float = 0.0,
         coord_dim: int = BBOX_COORD_DIM,
+        coord_format: str = DEFAULT_COORD_FORMAT,
     ) -> None:
         super().__init__()
         hidden_dim = hidden_dim or max(128, hidden_size // 2)
@@ -296,6 +310,7 @@ class PolygonDetectionHead(nn.Module):
         self.hidden_dim = hidden_dim
         self.dropout = dropout
         self.coord_dim = coord_dim
+        self.coord_format = coord_format
         self.net = nn.Sequential(
             nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_dim),
@@ -314,7 +329,7 @@ class PolygonDetectionHead(nn.Module):
             "hidden_dim": self.hidden_dim,
             "dropout": self.dropout,
             "coord_dim": self.coord_dim,
-            "coord_format": BBOX_COORD_FORMAT,
+            "coord_format": self.coord_format,
         }
 
 
@@ -335,6 +350,7 @@ class Qwen3VLPolygonModel(nn.Module):
         poly_detection_loss_type: str = "l1",
         poly_detection_source: str = "embedding",
         poly_detection_dropout: float = 0.0,
+        coord_format: str = DEFAULT_COORD_FORMAT,
     ) -> None:
         super().__init__()
         self.base_model = base_model
@@ -345,9 +361,11 @@ class Qwen3VLPolygonModel(nn.Module):
         self._config = base_model.config
         self.generation_config = getattr(base_model, "generation_config", None)
         self.hidden_size = _resolve_hidden_size(base_model.config)
+        self.coord_format = coord_format
         self.poly_detection_head = PolygonDetectionHead(
             self.hidden_size,
             dropout=poly_detection_dropout,
+            coord_format=coord_format,
         )
         self.poly_detection_loss_weight = float(poly_detection_loss_weight)
         self.poly_detection_loss_type = poly_detection_loss_type
@@ -380,6 +398,7 @@ class Qwen3VLPolygonModel(nn.Module):
         poly_detection_loss_type: str = "l1",
         poly_detection_source: str = "embedding",
         poly_detection_dropout: float = 0.0,
+        coord_format: str = DEFAULT_COORD_FORMAT,
         trust_remote_code: bool = False,
     ) -> "Qwen3VLPolygonModel":
         processor = AutoProcessor.from_pretrained(
@@ -403,6 +422,7 @@ class Qwen3VLPolygonModel(nn.Module):
             transformer_heads=transformer_heads,
             transformer_ffn_dim=transformer_ffn_dim,
             transformer_max_positions=transformer_max_positions,
+            coord_format=coord_format,
         )
         return cls(
             base_model=base_model,
@@ -415,6 +435,7 @@ class Qwen3VLPolygonModel(nn.Module):
             poly_detection_loss_type=poly_detection_loss_type,
             poly_detection_source=poly_detection_source,
             poly_detection_dropout=poly_detection_dropout,
+            coord_format=coord_format,
         )
 
     def _validate_poly_detection_config(self) -> None:

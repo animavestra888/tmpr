@@ -3,34 +3,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+source scripts/experiments/common_train_params.sh
 
-PYTHON="python"
-MODEL_DIR="models/Qwen3-VL-2B-Instruct"
-TRAIN_JSONL="data/hiertext/jsonl_max300/train.jsonl"
-EVAL_JSONL="data/hiertext/jsonl_max300/validation.jsonl"
-OUTPUT_DIR="runs/hiertext_polygon_mlp_stage1_encoder"
-DEEPSPEED_CONFIG="configs/deepspeed_zero2.json"
-
-DEVICE="auto"
-DTYPE="bfloat16"
-MAX_PIXELS=327680
-MAX_EVAL_SAMPLES=128
-
-PER_DEVICE_TRAIN_BATCH_SIZE=1
-PER_DEVICE_EVAL_BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=8
-LEARNING_RATE=2e-4
-WEIGHT_DECAY=0.01
-NUM_TRAIN_EPOCHS=1.0
-MAX_STEPS=-1
-LOGGING_STEPS=10
-SAVE_STEPS=200
-EVAL_STEPS=200
-SAVE_TOTAL_LIMIT=2
-POLYGON_DROPOUT=0.1
+: "${OUTPUT_DIR:=runs/hiertext_polygon_mlp_stage1_encoder}"
+set_common_train_defaults
+set_polygon_embedding_defaults
+set_reproducibility_args
 
 "${PYTHON}" scripts/train_hiertext_paragraphs.py \
   --polygon-mode embedding \
+  --embedding-geometry "${EMBEDDING_GEOMETRY}" \
   --polygon-encoder mlp \
   --disable-lora \
   --model-dir "${MODEL_DIR}" \
@@ -41,6 +23,8 @@ POLYGON_DROPOUT=0.1
   --max-pixels "${MAX_PIXELS}" \
   --device "${DEVICE}" \
   --dtype "${DTYPE}" \
+  --seed "${SEED}" \
+  --data-seed "${DATA_SEED}" \
   --per-device-train-batch-size "${PER_DEVICE_TRAIN_BATCH_SIZE}" \
   --per-device-eval-batch-size "${PER_DEVICE_EVAL_BATCH_SIZE}" \
   --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS}" \
@@ -54,4 +38,5 @@ POLYGON_DROPOUT=0.1
   --save-total-limit "${SAVE_TOTAL_LIMIT}" \
   --deepspeed "${DEEPSPEED_CONFIG}" \
   --polygon-dropout "${POLYGON_DROPOUT}" \
-  --gradient-checkpointing
+  --gradient-checkpointing \
+  "${TRAIN_EXTRA_ARGS[@]}"
