@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable
 
 
 _POINTER_PATTERN = re.compile(r"(\d+)\s*->\s*(\d+)")
@@ -12,6 +12,13 @@ _POINTER_PATTERN = re.compile(r"(\d+)\s*->\s*(\d+)")
 class PointerParseResult:
     pointers: dict[str, str]
     duplicate_sources: frozenset[str]
+
+
+@dataclass(frozen=True)
+class SanitizedPointerResult:
+    pointers: dict[str, str]
+    is_valid: bool
+    repairs: tuple[str, ...]
 
 
 def _canonical_line_id(value: str) -> str:
@@ -85,25 +92,173 @@ def pointers_to_clusters(
     )
 
 
-def line_accuracy(gold_text: str, prediction_text: str) -> float:
-    gold = parse_pointer_output(gold_text).pointers
+def _choose_predecessor_to_keep(
+    sources: list[str],
+    *,
+    target: str,
+    id_order: dict[str, int],
+) -> str:
+    target_order = id_order[target]
+
+    def key(source: str) -> tuple[int, int, int]:
+        source_order = id_order[source]
+        if source_order < target_order:
+            return 0, target_order - source_order, source_order
+        return 1, abs(source_order - target_order), source_order
+
+    return min(sources, key=key)
+
+
+def _find_cycle_start(
+    pointers: dict[str, str],
+    *,
+    expected_line_ids: list[str],
+    expected_ids: set[str],
+) -> list[str] | None:
+    for start in expected_line_ids:
+        path: list[str] = []
+        seen: dict[str, int] = {}
+        current = start
+        while current in expected_ids:
+            if current in seen:
+                return path[seen[current] :]
+            seen[current] = len(path)
+            path.append(current)
+            target = pointers[current]
+            if target == current:
+                break
+            current = target
+    return None
+
+
+def sanitize_pointer_output(
+    text: str,
+    *,
+    expected_line_ids: Iterable[str],
+) -> SanitizedPointerResult:
+    """Repair malformed pointer chains into a deterministic paragraph partition.
+
+    Repairs are intentionally conservative: missing/invalid outputs become
+    self-pointers, ambiguous multiple parents keep one predecessor, and cycles
+    are cut by making the latest line in the cycle point to itself.
+    """
+
+    line_ids = [_canonical_line_id(line_id) for line_id in expected_line_ids]
+    expected_ids = set(line_ids)
+    id_order = {line_id: index for index, line_id in enumerate(line_ids)}
+    parsed = parse_pointer_output(text)
+    repairs: list[str] = []
+    pointers: dict[str, str] = {}
+
+    for line_id in line_ids:
+        target = parsed.pointers.get(line_id)
+        if line_id in parsed.duplicate_sources:
+            pointers[line_id] = line_id
+            repairs.append("duplicate_source")
+        elif target is None:
+            pointers[line_id] = line_id
+            repairs.append("missing_source")
+        elif target not in expected_ids:
+            pointers[line_id] = line_id
+            repairs.append("invalid_target")
+        else:
+            pointers[line_id] = target
+
+    for source in parsed.pointers:
+        if source not in expected_ids:
+            repairs.append("unexpected_source")
+
+    incoming: dict[str, list[str]] = {line_id: [] for line_id in line_ids}
+    for source, target in pointers.items():
+        # Self-pointers are paragraph ends, not another parent pointing into the line.
+        if source != target:
+            incoming[target].append(source)
+
+    for target, sources in incoming.items():
+        if len(sources) <= 1:
+            continue
+        keep_source = _choose_predecessor_to_keep(sources, target=target, id_order=id_order)
+        for source in sources:
+            if source == keep_source:
+                continue
+            pointers[source] = source
+            repairs.append("ambiguous_parent")
+
+    while True:
+        cycle = _find_cycle_start(
+            pointers,
+            expected_line_ids=line_ids,
+            expected_ids=expected_ids,
+        )
+        if cycle is None:
+            break
+        end_line_id = max(cycle, key=lambda line_id: id_order[line_id])
+        pointers[end_line_id] = end_line_id
+        repairs.append("cycle")
+
+    return SanitizedPointerResult(
+        pointers=pointers,
+        is_valid=not repairs,
+        repairs=tuple(repairs),
+    )
+
+
+def pointers_to_pointer_text(
+    pointers: dict[str, str],
+    *,
+    expected_line_ids: Iterable[str],
+) -> str:
+    line_ids = [_canonical_line_id(line_id) for line_id in expected_line_ids]
+    return "\n".join(f"{line_id}->{pointers[line_id]}" for line_id in line_ids)
+
+
+def line_accuracy(gt_text: str, prediction_text: str) -> float:
+    gt = parse_pointer_output(gt_text).pointers
     prediction = parse_pointer_output(prediction_text).pointers
-    if not gold:
+    if not gt:
         return 1.0 if not prediction else 0.0
-    correct = sum(1 for source, target in gold.items() if prediction.get(source) == target)
-    return correct / len(gold)
+    correct = sum(1 for source, target in gt.items() if prediction.get(source) == target)
+    return correct / len(gt)
 
 
-def global_accuracy(gold_text: str, prediction_text: str) -> float:
-    gold_parse = parse_pointer_output(gold_text)
+def global_accuracy(gt_text: str, prediction_text: str) -> float:
+    gt_parse = parse_pointer_output(gt_text)
     pred_parse = parse_pointer_output(prediction_text)
     if pred_parse.duplicate_sources:
         return 0.0
 
-    expected_ids = gold_parse.pointers.keys()
-    gold_clusters = pointers_to_clusters(gold_parse.pointers, expected_line_ids=expected_ids)
+    expected_ids = gt_parse.pointers.keys()
+    gt_clusters = pointers_to_clusters(gt_parse.pointers, expected_line_ids=expected_ids)
     pred_clusters = pointers_to_clusters(pred_parse.pointers, expected_line_ids=expected_ids)
-    return 1.0 if pred_clusters is not None and pred_clusters == gold_clusters else 0.0
+    return 1.0 if pred_clusters is not None and pred_clusters == gt_clusters else 0.0
+
+
+def _line_id_from_record(line: dict[str, Any], fallback: int) -> str:
+    return _canonical_line_id(str(line.get("id", fallback)))
+
+
+def ocr_lines_to_pointer_text(ocr_lines: list[dict[str, Any]]) -> str:
+    """Convert HierText-style OCR lines with paragraph ids into pointer text."""
+
+    line_ids = [_line_id_from_record(line, index) for index, line in enumerate(ocr_lines)]
+    id_order = {line_id: index for index, line_id in enumerate(line_ids)}
+    clusters: dict[int, list[str]] = {}
+    for line_id, line in zip(line_ids, ocr_lines):
+        paragraph_id = int(line.get("paragraph_id", -1))
+        clusters.setdefault(paragraph_id, []).append(line_id)
+
+    pointers: dict[str, str] = {}
+    ordered_clusters = sorted(
+        clusters.values(),
+        key=lambda cluster: min(id_order[line_id] for line_id in cluster),
+    )
+    for cluster in ordered_clusters:
+        cluster = sorted(cluster, key=lambda line_id: id_order[line_id])
+        for index, line_id in enumerate(cluster):
+            next_id = cluster[index + 1] if index + 1 < len(cluster) else line_id
+            pointers[line_id] = next_id
+
+    return "\n".join(f"{line_id}->{pointers[line_id]}" for line_id in line_ids)
 
 
 def evaluate_pointer_outputs(records: Iterable[tuple[str, str]]) -> dict[str, float]:
@@ -113,16 +268,16 @@ def evaluate_pointer_outputs(records: Iterable[tuple[str, str]]) -> dict[str, fl
     global_correct = 0
     valid_predictions = 0
 
-    for gold_text, prediction_text in records:
+    for gt_text, prediction_text in records:
         total_samples += 1
-        gold_parse = parse_pointer_output(gold_text)
+        gt_parse = parse_pointer_output(gt_text)
         pred_parse = parse_pointer_output(prediction_text)
-        expected_ids = gold_parse.pointers.keys()
+        expected_ids = gt_parse.pointers.keys()
 
-        total_lines += len(gold_parse.pointers)
+        total_lines += len(gt_parse.pointers)
         correct_lines += sum(
             1
-            for source, target in gold_parse.pointers.items()
+            for source, target in gt_parse.pointers.items()
             if pred_parse.pointers.get(source) == target
         )
 
@@ -132,8 +287,8 @@ def evaluate_pointer_outputs(records: Iterable[tuple[str, str]]) -> dict[str, fl
         if pred_clusters is not None:
             valid_predictions += 1
 
-        gold_clusters = pointers_to_clusters(gold_parse.pointers, expected_line_ids=expected_ids)
-        if pred_clusters is not None and pred_clusters == gold_clusters:
+        gt_clusters = pointers_to_clusters(gt_parse.pointers, expected_line_ids=expected_ids)
+        if pred_clusters is not None and pred_clusters == gt_clusters:
             global_correct += 1
 
     if total_samples == 0:

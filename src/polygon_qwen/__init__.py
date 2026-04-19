@@ -13,8 +13,11 @@ from .metrics import (
     evaluate_pointer_outputs,
     global_accuracy,
     line_accuracy,
+    ocr_lines_to_pointer_text,
     parse_pointer_output,
+    pointers_to_pointer_text,
     pointers_to_clusters,
+    sanitize_pointer_output,
 )
 from .modeling import (
     PolygonDetectionHead,
@@ -34,8 +37,11 @@ __all__ = [
     "HierTextParagraphClusteringDataset",
     "HierTextParagraphCollator",
     "line_accuracy",
+    "ocr_lines_to_pointer_text",
     "parse_pointer_output",
+    "pointers_to_pointer_text",
     "pointers_to_clusters",
+    "sanitize_pointer_output",
     "polygon_to_bbox_2d",
     "polygon_to_embedding_coords",
     "polygon_to_minrect_8coords",

@@ -329,10 +329,20 @@ class HierTextParagraphClusteringDataset(Dataset):
             )
 
         polygon_coords = np.asarray([line.coords for line in lines], dtype=np.float32)
+        ocr_lines = [
+            {
+                "id": int(line.line_id),
+                "text": line.text,
+                "polygon": line.vertices,
+                "paragraph_id": line.paragraph_index,
+            }
+            for line in lines
+        ]
         return {
             "image": image,
             "image_id": image_id,
             "img_path": image_path.as_posix(),
+            "ocr_lines": ocr_lines,
             "prompt": self._build_prompt(
                 image_id=image_id,
                 image_width=width,

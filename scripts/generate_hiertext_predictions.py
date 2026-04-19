@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,9 @@ from polygon_qwen import (
     coord_format_to_embedding_geometry,
     embedding_geometry_to_coord_format,
     evaluate_pointer_outputs,
+    ocr_lines_to_pointer_text,
+    pointers_to_clusters,
+    sanitize_pointer_output,
 )
 from polygon_qwen.device import SUPPORTED_DEVICE_NAMES, resolve_device
 from polygon_qwen.processor import configure_processor
@@ -50,11 +54,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transformer-heads", type=int, default=4)
     parser.add_argument("--transformer-ffn-dim", type=int, default=1024)
     parser.add_argument("--transformer-max-positions", type=int, default=2048)
-    parser.add_argument("--max-samples", type=int, default=5)
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=0,
+        help="Limit the number of examples. Use 0 or a negative value to run the full split.",
+    )
     parser.add_argument("--coord-precision", type=int, default=4)
     parser.add_argument("--bbox-scale", type=int, default=1000)
-    parser.add_argument("--max-pixels", type=int, default=50176)
-    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--max-pixels", type=int, default=327680)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--device", choices=SUPPORTED_DEVICE_NAMES, default="auto")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     return parser.parse_args()
@@ -68,6 +77,10 @@ def resolve_dtype(name: str) -> torch.dtype:
     if name == "float32":
         return torch.float32
     raise ValueError(f"Unsupported dtype: {name}")
+
+
+def resolve_sample_limit(max_samples: int) -> int | None:
+    return None if max_samples <= 0 else max_samples
 
 
 def load_qwen_model(model_dir: Path, *, dtype: torch.dtype) -> torch.nn.Module:
@@ -177,6 +190,43 @@ def normalize_multimodal_keys(batch: dict[str, Any]) -> dict[str, Any]:
     return batch
 
 
+def _line_id(line: dict[str, Any], fallback: int) -> str:
+    return str(int(line.get("id", fallback)))
+
+
+def prediction_to_ocr_lines(
+    *,
+    gt_ocr_lines: list[dict[str, Any]],
+    prediction_text: str,
+) -> tuple[list[dict[str, Any]], bool, dict[str, int]]:
+    expected_line_ids = [_line_id(line, index) for index, line in enumerate(gt_ocr_lines)]
+    sanitized = sanitize_pointer_output(
+        prediction_text,
+        expected_line_ids=expected_line_ids,
+    )
+    pred_clusters = pointers_to_clusters(sanitized.pointers, expected_line_ids=expected_line_ids)
+    if pred_clusters is None:
+        raise ValueError("Sanitized pointer output is still invalid.")
+    id_order = {line_id: index for index, line_id in enumerate(expected_line_ids)}
+    predicted_paragraphs: dict[str, int] = {}
+    for paragraph_id, cluster in enumerate(pred_clusters):
+        for line_id in sorted(cluster, key=lambda item: id_order[item]):
+            predicted_paragraphs[line_id] = paragraph_id
+
+    repair_counts: dict[str, int] = {}
+    for reason in sanitized.repairs:
+        repair_counts[reason] = repair_counts.get(reason, 0) + 1
+
+    predicted_lines: list[dict[str, Any]] = []
+    for index, line in enumerate(gt_ocr_lines):
+        line_id = _line_id(line, index)
+        predicted_line = dict(line)
+        predicted_line["id"] = int(line_id)
+        predicted_line["paragraph_id"] = int(predicted_paragraphs.get(line_id, -1))
+        predicted_lines.append(predicted_line)
+    return predicted_lines, sanitized.is_valid, repair_counts
+
+
 def generate_text_prediction(
     *,
     model: torch.nn.Module,
@@ -276,7 +326,7 @@ def main() -> None:
     dataset = HierTextParagraphClusteringDataset(
         jsonl_path=args.jsonl_path,
         path_root=args.path_root,
-        limit=args.max_samples,
+        limit=resolve_sample_limit(args.max_samples),
         polygon_mode=args.polygon_mode,
         embedding_geometry=embedding_geometry,
         poly_token=args.poly_token,
@@ -311,6 +361,7 @@ def main() -> None:
 
     args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     metric_records: list[tuple[str, str]] = []
+    start_time = time.perf_counter()
     with args.output_jsonl.open("w", encoding="utf-8") as output_handle:
         for index in range(len(dataset)):
             example = dataset[index]
@@ -331,21 +382,41 @@ def main() -> None:
                     max_new_tokens=args.max_new_tokens,
                 )
 
-            metric_records.append((example["answer"], prediction))
+            predicted_ocr_lines, prediction_valid, prediction_repair_counts = prediction_to_ocr_lines(
+                gt_ocr_lines=example["ocr_lines"],
+                prediction_text=prediction,
+            )
             record = {
-                "image_path": example["img_path"],
+                "img_path": example["img_path"],
                 "num_lines": example["num_lines"],
-                "answer": prediction,
+                "ocr_lines": predicted_ocr_lines,
+                "gt_ocr_lines": example["ocr_lines"],
+                "gt_answer": example["answer"],
+                "model_answer": prediction,
+                "prediction_valid": prediction_valid,
+                "prediction_repair_counts": prediction_repair_counts,
             }
+            metric_records.append(
+                (
+                    ocr_lines_to_pointer_text(record["gt_ocr_lines"]),
+                    ocr_lines_to_pointer_text(record["ocr_lines"]),
+                )
+            )
             output_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             print("\n" + "=" * 88)
             print(f"index: {index} | image_id: {example['image_id']} | lines: {example['num_lines']}")
-            print("GOLD:")
+            print("GT:")
             print(example["answer"])
-            print("PREDICTION:")
+            print("MODEL ANSWER:")
             print(prediction or "<empty>")
+            print(f"prediction_valid: {prediction_valid}")
+            if prediction_repair_counts:
+                print(f"prediction_repair_counts: {json.dumps(prediction_repair_counts, ensure_ascii=False)}")
 
     metrics = evaluate_pointer_outputs(metric_records)
+    inference_seconds = time.perf_counter() - start_time
+    metrics["inference_time"] = inference_seconds
+    metrics["samples_per_second"] = len(metric_records) / inference_seconds if inference_seconds > 0 else 0.0
     print("\nMETRICS")
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
     print(f"\nwrote: {args.output_jsonl}")
