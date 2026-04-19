@@ -1,4 +1,8 @@
 #!/bin/bash
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 
 PYTHON="python"
 MODEL_DIR="models/Qwen3-VL-2B-Instruct"

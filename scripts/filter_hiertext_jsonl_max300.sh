@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+cd "$(dirname "$0")/.."
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+
 PYTHON="python"
 INPUT_DIR="data/hiertext/jsonl"
 OUTPUT_DIR="data/hiertext/jsonl_max300"

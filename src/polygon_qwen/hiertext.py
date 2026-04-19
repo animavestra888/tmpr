@@ -11,7 +11,9 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from .geometry import polygon_to_bbox_2d, polygon_to_minrect_8coords
+from .geometry import polygon_to_bbox_2d, polygon_to_normalized_bbox_8coords
+
+BBOX_COORD_DIM = 8
 
 
 def load_hiertext_annotations(path: str | Path) -> list[dict[str, Any]]:
@@ -250,7 +252,7 @@ class HierTextParagraphClusteringDataset(Dataset):
                     {
                         "id": int(line.line_id),
                         "text": line.text,
-                        "polygon": self.poly_token,
+                        "bbox_2d": self.poly_token,
                     }
                 )
             else:
@@ -264,8 +266,9 @@ class HierTextParagraphClusteringDataset(Dataset):
 
         if self.polygon_mode == "embedding":
             geometry_description = (
-                "Each line has a stable id, recognized text when present, and a polygon. "
-                "The polygon placeholder is replaced by a learned embedding of that line's normalized geometry."
+                "Each line has a stable id, recognized text when present, and bbox_2d. "
+                "The bbox_2d placeholder is replaced by a learned embedding of that line's "
+                "normalized four-corner axis-aligned bbox geometry."
             )
         else:
             geometry_description = (
@@ -307,7 +310,7 @@ class HierTextParagraphClusteringDataset(Dataset):
         width, height = image.size
 
         for line in lines:
-            coords = polygon_to_minrect_8coords(
+            coords = polygon_to_normalized_bbox_8coords(
                 line.vertices,
                 image_width=width,
                 image_height=height,
@@ -415,7 +418,7 @@ class HierTextParagraphCollator:
             polygon_coords = torch.zeros(
                 len(examples),
                 max_polygons,
-                8,
+                BBOX_COORD_DIM,
                 dtype=torch.float32,
             )
             for row_index, example in enumerate(examples):

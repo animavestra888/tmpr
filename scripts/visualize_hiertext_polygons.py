@@ -11,8 +11,6 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from polygon_qwen.geometry import order_box_corners
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -67,6 +65,18 @@ def resize_for_view(image: Image.Image, max_image_side: int) -> tuple[Image.Imag
 
 def scale_polygon(polygon: list[list[float]], scale: float) -> list[tuple[float, float]]:
     return [(float(x) * scale, float(y) * scale) for x, y in polygon]
+
+
+def order_box_corners(points: np.ndarray) -> np.ndarray:
+    box = np.asarray(points, dtype=np.float32)
+    if box.shape != (4, 2):
+        raise ValueError(f"Expected box corners with shape (4, 2), received {box.shape}.")
+
+    center = box.mean(axis=0)
+    angles = np.arctan2(box[:, 1] - center[1], box[:, 0] - center[0])
+    ordered = box[np.argsort(angles)]
+    start_index = int(np.argmin(ordered[:, 1] + ordered[:, 0]))
+    return np.roll(ordered, -start_index, axis=0).astype(np.float32)
 
 
 def min_area_rect(points_xy: list[list[float]]) -> list[tuple[float, float]]:

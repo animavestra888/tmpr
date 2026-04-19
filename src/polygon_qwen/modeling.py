@@ -6,12 +6,16 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 try:
     from transformers import Qwen3VLForConditionalGeneration
 except ImportError:  # pragma: no cover - depends on transformers version
     Qwen3VLForConditionalGeneration = None
+
+BBOX_COORD_DIM = 8
+BBOX_COORD_FORMAT = "bbox_corners_xyxy"
 
 
 def _call_with_supported_kwargs(fn: Any, **kwargs: Any) -> Any:
@@ -97,12 +101,13 @@ def _ensure_poly_token(processor: Any, model: nn.Module, poly_token: str) -> int
 class PolygonMLPEncoder(nn.Module):
     encoder_type = "mlp"
 
-    def __init__(self, out_dim: int = 2048, dropout: float = 0.1) -> None:
+    def __init__(self, out_dim: int = 2048, dropout: float = 0.1, coord_dim: int = BBOX_COORD_DIM) -> None:
         super().__init__()
         self.out_dim = out_dim
         self.dropout = dropout
+        self.coord_dim = coord_dim
         self.net = nn.Sequential(
-            nn.Linear(8, 256),
+            nn.Linear(coord_dim, 256),
             nn.GELU(),
             nn.LayerNorm(256),
             nn.Dropout(dropout),
@@ -118,12 +123,13 @@ class PolygonMLPEncoder(nn.Module):
         polygon_coords: torch.Tensor,
         polygon_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if polygon_coords.ndim < 2 or polygon_coords.shape[-1] != 8:
+        if polygon_coords.ndim < 2 or polygon_coords.shape[-1] != self.coord_dim:
             raise ValueError(
-                f"Expected polygon_coords with shape (..., 8), received {tuple(polygon_coords.shape)}."
+                f"Expected polygon_coords with shape (..., {self.coord_dim}), "
+                f"received {tuple(polygon_coords.shape)}."
             )
         leading_shape = polygon_coords.shape[:-1]
-        flat_coords = polygon_coords.reshape(-1, 8)
+        flat_coords = polygon_coords.reshape(-1, self.coord_dim)
         flat_embeds = self.net(flat_coords)
         return flat_embeds.reshape(*leading_shape, flat_embeds.shape[-1])
 
@@ -131,6 +137,8 @@ class PolygonMLPEncoder(nn.Module):
         return {
             "out_dim": self.out_dim,
             "dropout": self.dropout,
+            "coord_dim": self.coord_dim,
+            "coord_format": BBOX_COORD_FORMAT,
         }
 
 
@@ -147,6 +155,7 @@ class PolygonLayoutTransformerEncoder(nn.Module):
         dim_feedforward: int = 1024,
         dropout: float = 0.1,
         max_position_embeddings: int = 2048,
+        coord_dim: int = BBOX_COORD_DIM,
     ) -> None:
         super().__init__()
         self.out_dim = out_dim
@@ -156,8 +165,9 @@ class PolygonLayoutTransformerEncoder(nn.Module):
         self.dim_feedforward = dim_feedforward
         self.dropout = dropout
         self.max_position_embeddings = max_position_embeddings
+        self.coord_dim = coord_dim
 
-        self.coord_projection = nn.Linear(8, d_model)
+        self.coord_projection = nn.Linear(coord_dim, d_model)
         self.coord_norm = nn.LayerNorm(d_model)
         self.position_embedding = nn.Embedding(max_position_embeddings, d_model)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -192,7 +202,7 @@ class PolygonLayoutTransformerEncoder(nn.Module):
         polygon_counts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         squeeze_polygon_dim = False
-        if polygon_coords.ndim == 2 and polygon_coords.shape[-1] == 8:
+        if polygon_coords.ndim == 2 and polygon_coords.shape[-1] == self.coord_dim:
             polygon_coords = polygon_coords.unsqueeze(1)
             squeeze_polygon_dim = True
             polygon_counts = torch.ones(
@@ -200,9 +210,10 @@ class PolygonLayoutTransformerEncoder(nn.Module):
                 dtype=torch.long,
                 device=polygon_coords.device,
             )
-        elif polygon_coords.ndim != 3 or polygon_coords.shape[-1] != 8:
+        elif polygon_coords.ndim != 3 or polygon_coords.shape[-1] != self.coord_dim:
             raise ValueError(
-                f"Expected polygon_coords with shape (batch, 8) or (batch, num_polygons, 8), "
+                f"Expected polygon_coords with shape (batch, {self.coord_dim}) or "
+                f"(batch, num_polygons, {self.coord_dim}), "
                 f"received {tuple(polygon_coords.shape)}."
             )
 
@@ -238,6 +249,8 @@ class PolygonLayoutTransformerEncoder(nn.Module):
             "dim_feedforward": self.dim_feedforward,
             "dropout": self.dropout,
             "max_position_embeddings": self.max_position_embeddings,
+            "coord_dim": self.coord_dim,
+            "coord_format": BBOX_COORD_FORMAT,
         }
 
 
@@ -267,6 +280,44 @@ def build_polygon_encoder(
     raise ValueError("polygon_encoder_type must be either 'mlp' or 'transformer'.")
 
 
+class PolygonDetectionHead(nn.Module):
+    """Predict normalized four-corner axis-aligned bbox coordinates."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        hidden_dim: int | None = None,
+        dropout: float = 0.0,
+        coord_dim: int = BBOX_COORD_DIM,
+    ) -> None:
+        super().__init__()
+        hidden_dim = hidden_dim or max(128, hidden_size // 2)
+        self.hidden_size = hidden_size
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+        self.coord_dim = coord_dim
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, coord_dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.net(hidden_states)
+
+    def config_dict(self) -> dict[str, Any]:
+        return {
+            "hidden_size": self.hidden_size,
+            "hidden_dim": self.hidden_dim,
+            "dropout": self.dropout,
+            "coord_dim": self.coord_dim,
+            "coord_format": BBOX_COORD_FORMAT,
+        }
+
+
 class Qwen3VLPolygonModel(nn.Module):
     """Qwen3-VL wrapper that replaces the `<poly>` token embedding per sample."""
     supports_gradient_checkpointing = True
@@ -280,6 +331,10 @@ class Qwen3VLPolygonModel(nn.Module):
         poly_token_id: int,
         poly_token: str = "<poly>",
         freeze_base_model: bool = True,
+        poly_detection_loss_weight: float = 0.0,
+        poly_detection_loss_type: str = "l1",
+        poly_detection_source: str = "embedding",
+        poly_detection_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.base_model = base_model
@@ -290,6 +345,16 @@ class Qwen3VLPolygonModel(nn.Module):
         self._config = base_model.config
         self.generation_config = getattr(base_model, "generation_config", None)
         self.hidden_size = _resolve_hidden_size(base_model.config)
+        self.poly_detection_head = PolygonDetectionHead(
+            self.hidden_size,
+            dropout=poly_detection_dropout,
+        )
+        self.poly_detection_loss_weight = float(poly_detection_loss_weight)
+        self.poly_detection_loss_type = poly_detection_loss_type
+        self.poly_detection_source = poly_detection_source
+        self.poly_detection_dropout = poly_detection_dropout
+        self._validate_poly_detection_config()
+        self.set_poly_detection_enabled(self.poly_detection_loss_weight > 0.0)
 
         if freeze_base_model:
             for parameter in self.base_model.parameters():
@@ -311,6 +376,10 @@ class Qwen3VLPolygonModel(nn.Module):
         transformer_heads: int = 4,
         transformer_ffn_dim: int = 1024,
         transformer_max_positions: int = 2048,
+        poly_detection_loss_weight: float = 0.0,
+        poly_detection_loss_type: str = "l1",
+        poly_detection_source: str = "embedding",
+        poly_detection_dropout: float = 0.0,
         trust_remote_code: bool = False,
     ) -> "Qwen3VLPolygonModel":
         processor = AutoProcessor.from_pretrained(
@@ -342,7 +411,32 @@ class Qwen3VLPolygonModel(nn.Module):
             poly_token_id=poly_token_id,
             poly_token=poly_token,
             freeze_base_model=freeze_base_model,
+            poly_detection_loss_weight=poly_detection_loss_weight,
+            poly_detection_loss_type=poly_detection_loss_type,
+            poly_detection_source=poly_detection_source,
+            poly_detection_dropout=poly_detection_dropout,
         )
+
+    def _validate_poly_detection_config(self) -> None:
+        if self.poly_detection_loss_weight < 0.0:
+            raise ValueError("poly_detection_loss_weight must be non-negative.")
+        if self.poly_detection_loss_type not in {"l1", "l2", "smooth_l1"}:
+            raise ValueError("poly_detection_loss_type must be one of: l1, l2, smooth_l1.")
+        if self.poly_detection_source not in {"embedding", "hidden"}:
+            raise ValueError("poly_detection_source must be either 'embedding' or 'hidden'.")
+
+    def set_poly_detection_enabled(self, enabled: bool) -> None:
+        for parameter in self.poly_detection_head.parameters():
+            parameter.requires_grad = enabled
+
+    def poly_detection_config_dict(self) -> dict[str, Any]:
+        return {
+            "loss_weight": self.poly_detection_loss_weight,
+            "loss_type": self.poly_detection_loss_type,
+            "source": self.poly_detection_source,
+            "dropout": self.poly_detection_dropout,
+            "head": self.poly_detection_head.config_dict(),
+        }
 
     def trainable_parameters(self) -> list[nn.Parameter]:
         return [parameter for parameter in self.parameters() if parameter.requires_grad]
@@ -401,6 +495,8 @@ class Qwen3VLPolygonModel(nn.Module):
                     if hasattr(self.polygon_encoder, "config_dict")
                     else {}
                 ),
+                "poly_detection_head": self.poly_detection_head.state_dict(),
+                "poly_detection_config": self.poly_detection_config_dict(),
                 "poly_token": self.poly_token,
                 "poly_token_id": self.poly_token_id,
                 "hidden_size": self.hidden_size,
@@ -410,6 +506,44 @@ class Qwen3VLPolygonModel(nn.Module):
         )
         return adapter_path
 
+    def load_poly_detection_head(self, state_dict: dict[str, torch.Tensor]) -> None:
+        self.poly_detection_head.load_state_dict(state_dict)
+
+    def _polygon_targets_for_counts(
+        self,
+        *,
+        polygon_coords: torch.Tensor,
+        expected_counts: torch.Tensor,
+    ) -> torch.Tensor:
+        if polygon_coords.ndim == 2:
+            return polygon_coords
+
+        targets = []
+        for batch_index, count_tensor in enumerate(expected_counts):
+            count = int(count_tensor.item())
+            if count == 0:
+                continue
+            targets.append(polygon_coords[batch_index, :count])
+        if not targets:
+            return polygon_coords.new_zeros((0, self.poly_detection_head.coord_dim))
+        return torch.cat(targets, dim=0)
+
+    def _compute_poly_detection_loss(
+        self,
+        *,
+        token_states: torch.Tensor,
+        polygon_targets: torch.Tensor,
+    ) -> torch.Tensor:
+        predictions = self.poly_detection_head(token_states).float()
+        targets = polygon_targets.to(device=predictions.device, dtype=torch.float32)
+        if self.poly_detection_loss_type == "l1":
+            return F.l1_loss(predictions, targets)
+        if self.poly_detection_loss_type == "l2":
+            return F.mse_loss(predictions, targets)
+        if self.poly_detection_loss_type == "smooth_l1":
+            return F.smooth_l1_loss(predictions, targets)
+        raise ValueError(f"Unsupported polygon detection loss: {self.poly_detection_loss_type}")
+
     def _replace_polygon_embeddings(
         self,
         *,
@@ -417,7 +551,8 @@ class Qwen3VLPolygonModel(nn.Module):
         inputs_embeds: torch.Tensor,
         polygon_coords: torch.Tensor,
         polygon_counts: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_auxiliary: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         poly_mask = input_ids.eq(self.poly_token_id)
         occurrences = poly_mask.sum(dim=1)
 
@@ -430,7 +565,8 @@ class Qwen3VLPolygonModel(nn.Module):
                 expected_counts = polygon_counts.to(device=occurrences.device, dtype=occurrences.dtype)
         else:
             raise ValueError(
-                f"Expected polygon_coords with shape (batch, 8) or (batch, num_polygons, 8), "
+                f"Expected polygon_coords with shape (batch, {BBOX_COORD_DIM}) or "
+                f"(batch, num_polygons, {BBOX_COORD_DIM}), "
                 f"received {tuple(polygon_coords.shape)}."
             )
 
@@ -460,10 +596,17 @@ class Qwen3VLPolygonModel(nn.Module):
 
         updated = inputs_embeds.clone()
         if polygon_embeds.ndim == 2:
-            updated[poly_mask] = polygon_embeds.to(
+            polygon_embeds = polygon_embeds.to(
                 device=updated.device,
                 dtype=updated.dtype,
             )
+            updated[poly_mask] = polygon_embeds
+            if return_auxiliary:
+                polygon_targets = self._polygon_targets_for_counts(
+                    polygon_coords=polygon_coords,
+                    expected_counts=expected_counts,
+                )
+                return updated, poly_mask, polygon_embeds, polygon_targets
             return updated
 
         polygon_embeds = polygon_embeds.to(device=updated.device, dtype=updated.dtype)
@@ -473,6 +616,12 @@ class Qwen3VLPolygonModel(nn.Module):
             if count == 0:
                 continue
             updated[batch_index, positions[:count]] = polygon_embeds[batch_index, :count]
+        if return_auxiliary:
+            polygon_targets = self._polygon_targets_for_counts(
+                polygon_coords=polygon_coords,
+                expected_counts=expected_counts,
+            )
+            return updated, poly_mask, updated[poly_mask], polygon_targets
         return updated
 
     def _compute_position_ids(
@@ -535,13 +684,19 @@ class Qwen3VLPolygonModel(nn.Module):
             second_per_grid_ts.to(target_device) if second_per_grid_ts is not None else None
         )
 
+        detection_enabled = self.poly_detection_loss_weight > 0.0
         inputs_embeds = self.base_model.get_input_embeddings()(input_ids)
-        inputs_embeds = self._replace_polygon_embeddings(
+        replaced = self._replace_polygon_embeddings(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             polygon_coords=polygon_coords,
             polygon_counts=polygon_counts,
+            return_auxiliary=detection_enabled,
         )
+        if detection_enabled:
+            inputs_embeds, poly_mask, polygon_embedding_states, polygon_targets = replaced
+        else:
+            inputs_embeds = replaced
 
         position_ids = self._compute_position_ids(
             input_ids=input_ids,
@@ -553,7 +708,14 @@ class Qwen3VLPolygonModel(nn.Module):
             mm_token_type_ids=mm_token_type_ids,
         )
 
-        return self.base_model(
+        requested_output_hidden_states = kwargs.pop("output_hidden_states", None)
+        output_hidden_states = (
+            True
+            if detection_enabled and self.poly_detection_source == "hidden"
+            else requested_output_hidden_states
+        )
+
+        outputs = self.base_model(
             input_ids=None,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -564,5 +726,25 @@ class Qwen3VLPolygonModel(nn.Module):
             mm_token_type_ids=mm_token_type_ids,
             video_grid_thw=video_grid_thw,
             second_per_grid_ts=second_per_grid_ts,
+            output_hidden_states=output_hidden_states,
             **kwargs,
         )
+
+        if detection_enabled:
+            if self.poly_detection_source == "hidden":
+                if outputs.hidden_states is None:
+                    raise ValueError("Base model did not return hidden states for polygon detection loss.")
+                token_states = outputs.hidden_states[-1][poly_mask]
+            else:
+                token_states = polygon_embedding_states
+            detection_loss = self._compute_poly_detection_loss(
+                token_states=token_states,
+                polygon_targets=polygon_targets,
+            )
+            total_loss = detection_loss * self.poly_detection_loss_weight
+            if outputs.loss is not None:
+                total_loss = outputs.loss + total_loss
+            outputs.loss = total_loss
+            outputs.poly_detection_loss = detection_loss.detach()
+
+        return outputs

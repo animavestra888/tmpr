@@ -55,6 +55,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--poly-token", type=str, default="<poly>")
     parser.add_argument("--polygon-dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--poly-det-loss-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary coordinate-reconstruction loss weight for <poly> token states. 0 disables it.",
+    )
+    parser.add_argument(
+        "--poly-det-loss-type",
+        choices=["l1", "l2", "smooth_l1"],
+        default="l1",
+        help="Loss type for the auxiliary <poly> coordinate head.",
+    )
+    parser.add_argument(
+        "--poly-det-source",
+        choices=["embedding", "hidden"],
+        default="embedding",
+        help="'embedding' is memory-safe; 'hidden' uses final LM hidden states and costs more memory.",
+    )
+    parser.add_argument("--poly-det-dropout", type=float, default=0.0)
     parser.add_argument("--transformer-d-model", type=int, default=256)
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument("--transformer-heads", type=int, default=4)
@@ -157,6 +176,26 @@ def resolve_polygon_adapter_path(adapter_path: Path | None) -> Path | None:
     return adapter_path
 
 
+def infer_adapter_coord_dim(payload: dict[str, Any]) -> int | None:
+    config = payload.get("polygon_encoder_config", {})
+    coord_dim = config.get("coord_dim")
+    if coord_dim is not None:
+        return int(coord_dim)
+
+    state_dict = payload.get("polygon_encoder", {})
+    for key in ("net.0.weight", "coord_projection.weight"):
+        weight = state_dict.get(key)
+        if torch.is_tensor(weight) and weight.ndim == 2:
+            return int(weight.shape[1])
+    return None
+
+
+def infer_adapter_coord_format(payload: dict[str, Any]) -> str | None:
+    config = payload.get("polygon_encoder_config", {})
+    coord_format = config.get("coord_format")
+    return str(coord_format) if coord_format is not None else None
+
+
 def load_polygon_adapter(model: Qwen3VLPolygonModel, adapter_path: Path) -> dict[str, Any]:
     payload = torch.load(adapter_path, map_location="cpu")
     saved_encoder_type = payload.get("polygon_encoder_type")
@@ -167,12 +206,28 @@ def load_polygon_adapter(model: Qwen3VLPolygonModel, adapter_path: Path) -> dict
             f"checkpoint has '{saved_encoder_type}', current model uses '{current_encoder_type}'."
         )
 
+    saved_coord_dim = infer_adapter_coord_dim(payload)
+    saved_coord_format = infer_adapter_coord_format(payload)
     saved_config = payload.get("polygon_encoder_config", {})
     current_config = (
         model.polygon_encoder.config_dict()
         if hasattr(model.polygon_encoder, "config_dict")
         else {}
     )
+    current_coord_dim = current_config.get("coord_dim")
+    current_coord_format = current_config.get("coord_format")
+    if saved_coord_dim is not None and current_coord_dim is not None and saved_coord_dim != current_coord_dim:
+        raise ValueError(
+            "Polygon adapter coordinate dimension mismatch: "
+            f"checkpoint has {saved_coord_dim}, current model uses {current_coord_dim}. "
+            "Current bbox-corner adapters use 8 coordinates."
+        )
+    if saved_coord_dim == current_coord_dim and saved_coord_format != current_coord_format:
+        raise ValueError(
+            "Polygon adapter coordinate format mismatch: "
+            f"checkpoint has {saved_coord_format!r}, current model uses {current_coord_format!r}. "
+            "Retrain the polygon adapter for axis-aligned bbox corners."
+        )
     ignored_config_keys = {"dropout"}
     mismatches = [
         f"{key}: checkpoint={saved_config[key]!r}, current={current_config[key]!r}"
@@ -184,6 +239,11 @@ def load_polygon_adapter(model: Qwen3VLPolygonModel, adapter_path: Path) -> dict
         raise ValueError(f"Polygon adapter config mismatch: {mismatch_text}")
 
     model.polygon_encoder.load_state_dict(payload["polygon_encoder"])
+    if "poly_detection_head" in payload:
+        model.load_poly_detection_head(payload["poly_detection_head"])
+        print("loaded polygon detection head")
+    elif model.poly_detection_loss_weight > 0.0:
+        print("polygon adapter has no detection head; training a new one")
     print(f"loaded polygon adapter: {adapter_path}")
     return payload
 
@@ -254,6 +314,8 @@ def main() -> None:
         raise ValueError("--polygon-adapter can only be used with --polygon-mode embedding.")
     if args.freeze_polygon_encoder and not use_polygon_embeddings:
         raise ValueError("--freeze-polygon-encoder can only be used with --polygon-mode embedding.")
+    if args.poly_det_loss_weight > 0.0 and not use_polygon_embeddings:
+        raise ValueError("--poly-det-loss-weight can only be used with --polygon-mode embedding.")
 
     if use_polygon_embeddings:
         model = Qwen3VLPolygonModel.from_pretrained(
@@ -268,6 +330,10 @@ def main() -> None:
             transformer_heads=args.transformer_heads,
             transformer_ffn_dim=args.transformer_ffn_dim,
             transformer_max_positions=args.transformer_max_positions,
+            poly_detection_loss_weight=args.poly_det_loss_weight,
+            poly_detection_loss_type=args.poly_det_loss_type,
+            poly_detection_source=args.poly_det_source,
+            poly_detection_dropout=args.poly_det_dropout,
         )
         adapter_path = resolve_polygon_adapter_path(args.polygon_adapter)
         if adapter_path is not None:
